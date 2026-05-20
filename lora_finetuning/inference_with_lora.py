@@ -11,11 +11,18 @@ if str(REPO_ROOT) not in sys.path:
 
 import soundfile as sf
 import torch
+from safetensors.torch import load_file
 
-from lora_finetuning.common import (apply_config_patch, apply_speaker_patch,
+from lora_finetuning.common import (apply_config_patch, apply_multi_speaker_patches,
+                                    apply_speaker_patch, apply_single_speaker_from_multi,
                                     load_json, load_lora_adapter,
                                     parse_torch_dtype)
 from qwen_tts import Qwen3TTSModel
+
+
+def is_multi_speaker_patch(patch_file: Path) -> bool:
+    state = load_file(str(patch_file))
+    return any(k.startswith("embedding_") for k in state)
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,11 +93,30 @@ def main() -> None:
     load_lora_adapter(qwen3tts.model, adapter_dir)
     config_patch = load_json(config_patch_file)
     apply_config_patch(qwen3tts.model, config_patch)
-    apply_speaker_patch(qwen3tts.model, speaker_patch_file)
-    qwen3tts.model.eval()
 
-    if speaker_name is None:
-        speaker_name = next(iter(config_patch["talker_config"]["spk_id"].keys()))
+    if is_multi_speaker_patch(speaker_patch_file):
+        available_speakers = list(config_patch.get("talker_config", {}).get("spk_id", {}).keys())
+        if not available_speakers:
+            raise ValueError("Multi-speaker patch but no speakers in config_patch")
+        if speaker_name is None:
+            if len(available_speakers) > 1:
+                raise ValueError(
+                    f"Multi-speaker bundle with {len(available_speakers)} speakers. "
+                    f"Please specify --speaker_name from: {available_speakers}"
+                )
+            speaker_name = available_speakers[0]
+        if speaker_name not in available_speakers:
+            raise ValueError(
+                f"Speaker '{speaker_name}' not found. Available: {available_speakers}"
+            )
+        apply_single_speaker_from_multi(qwen3tts.model, speaker_patch_file, config_patch, speaker_name)
+        print(f"Applied multi-speaker patch, selected: {speaker_name}")
+    else:
+        apply_speaker_patch(qwen3tts.model, speaker_patch_file)
+        if speaker_name is None:
+            speaker_name = next(iter(config_patch["talker_config"]["spk_id"].keys()))
+
+    qwen3tts.model.eval()
 
     wavs, sample_rate = qwen3tts.generate_custom_voice(
         text=args.text,

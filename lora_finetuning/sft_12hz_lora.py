@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import sys
 from pathlib import Path
@@ -27,14 +28,18 @@ from lora_finetuning.common import (DEFAULT_TARGET_MODULES,
                                     SUPPORTED_TARGET_SCOPES,
                                     build_target_module_regex,
                                     build_lora_config,
+                                    collect_unique_ref_audios,
                                     ensure_dir,
+                                    extract_multi_speaker_embeddings,
                                     extract_target_speaker_embedding,
                                     inject_lora, load_yaml_config,
                                     load_lora_adapter_weights,
                                     make_config_patch,
+                                    make_multi_speaker_config_patch,
                                     normalize_string_list,
                                     parse_torch_dtype, resolve_setting,
                                     save_json, save_lora_adapter,
+                                    save_multi_speaker_patch,
                                     save_speaker_patch)
 from qwen_tts import Qwen3TTSModel
 
@@ -49,6 +54,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--init_adapter_dir", type=str, default=None)
     parser.add_argument("--speaker_name", type=str, default=None)
     parser.add_argument("--speaker_id", type=int, default=None)
+    parser.add_argument("--speaker_base_id", type=int, default=None)
+    parser.add_argument("--speaker_names", nargs="*", default=None)
+    parser.add_argument("--multi_speaker", action="store_true", default=None)
 
     parser.add_argument("--torch_dtype", type=str, default=None)
     parser.add_argument("--attn_implementation", type=str, default=None)
@@ -65,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed_precision", type=str, default=None)
     parser.add_argument("--logging_steps", type=int, default=None)
     parser.add_argument("--sub_talker_loss_weight", type=float, default=None)
+    parser.add_argument("--cpu_threads", type=int, default=None)
     parser.add_argument("--validation_jsonl", type=str, default=None)
     parser.add_argument("--validation_split_ratio", type=float, default=None)
     parser.add_argument("--validation_max_samples", type=int, default=None)
@@ -98,6 +107,11 @@ def resolve_config(args: argparse.Namespace) -> ResolvedConfig:
     init_adapter_dir = resolve_setting(args.init_adapter_dir, cfg, "artifacts", "init_adapter_dir", None)
     speaker_name = resolve_setting(args.speaker_name, cfg, "data", "speaker_name", "speaker_test")
     speaker_id = resolve_setting(args.speaker_id, cfg, None, "speaker_id", 3000)
+    speaker_base_id = resolve_setting(args.speaker_base_id, cfg, None, "speaker_base_id", 3000)
+    speaker_names_override = args.speaker_names if args.speaker_names else (
+        resolve_setting(None, cfg, "data", "speaker_names", None)
+    )
+    multi_speaker_flag = resolve_setting(args.multi_speaker, cfg, "data", "multi_speaker", None)
 
     target_modules = normalize_string_list(
         args.target_modules if args.target_modules else resolve_setting(None, cfg, "lora", "target_modules", DEFAULT_TARGET_MODULES),
@@ -124,6 +138,9 @@ def resolve_config(args: argparse.Namespace) -> ResolvedConfig:
         init_adapter_dir=init_adapter_dir,
         speaker_name=speaker_name,
         speaker_id=int(speaker_id),
+        speaker_base_id=int(speaker_base_id),
+        speaker_names_override=speaker_names_override,
+        multi_speaker_flag=multi_speaker_flag,
         torch_dtype=resolve_setting(args.torch_dtype, cfg, "model", "dtype", "bfloat16"),
         attn_implementation=resolve_setting(args.attn_implementation, cfg, "model", "attn_implementation", "sdpa"),
         batch_size=int(resolve_setting(args.batch_size, cfg, "training", "batch_size", 2)),
@@ -137,6 +154,7 @@ def resolve_config(args: argparse.Namespace) -> ResolvedConfig:
         mixed_precision=resolve_setting(args.mixed_precision, cfg, "training", "mixed_precision", "bf16"),
         logging_steps=max(1, int(resolve_setting(args.logging_steps, cfg, "training", "logging_steps", 10))),
         sub_talker_loss_weight=float(resolve_setting(args.sub_talker_loss_weight, cfg, None, "sub_talker_loss_weight", 0.3)),
+        cpu_threads=resolve_setting(args.cpu_threads, cfg, "training", "cpu_threads", None),
         validation_split_ratio=float(resolve_setting(args.validation_split_ratio, cfg, "training", "validation_split_ratio", 0.0)),
         validation_max_samples=int(validation_max_samples) if validation_max_samples not in (None, "") else None,
         validation_seed=int(resolve_setting(args.validation_seed, cfg, "training", "validation_seed", 42)),
@@ -349,18 +367,39 @@ def get_current_lr(optimizer: AdamW) -> float:
     return float(optimizer.param_groups[0]["lr"])
 
 
+def configure_cpu_threading(accelerator: Accelerator, requested_threads: Any) -> int | None:
+    if requested_threads in (None, ""):
+        if accelerator.device.type == "cpu":
+            return None
+        requested_threads = min(4, os.cpu_count() or 1)
+
+    thread_count = max(1, int(requested_threads))
+    torch.set_num_threads(thread_count)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+    return thread_count
+
+
 def save_artifacts(
     output_dir: Path,
     unwrapped_model: torch.nn.Module,
     lora_config,
-    speaker_embedding: torch.Tensor,
+    speaker_embedding: torch.Tensor | dict[str, Any],
     resolved: ResolvedConfig,
     metrics: dict[str, Any],
+    is_multi_speaker: bool = False,
 ) -> None:
     output_dir = ensure_dir(output_dir)
     save_lora_adapter(unwrapped_model, output_dir / "adapter", lora_config)
-    save_speaker_patch(output_dir / "speaker_embedding.safetensors", resolved.speaker_id, speaker_embedding)
-    save_json(make_config_patch(resolved.speaker_name, resolved.speaker_id), output_dir / "config_patch.json")
+    if is_multi_speaker and isinstance(speaker_embedding, dict):
+        save_multi_speaker_patch(output_dir / "speaker_embedding.safetensors", speaker_embedding)
+        save_json(make_multi_speaker_config_patch(speaker_embedding), output_dir / "config_patch.json")
+    else:
+        embed = cast(torch.Tensor, speaker_embedding)
+        save_speaker_patch(output_dir / "speaker_embedding.safetensors", resolved.speaker_id, embed)
+        save_json(make_config_patch(resolved.speaker_name, resolved.speaker_id), output_dir / "config_patch.json")
     save_json(dict(resolved), output_dir / "train_args.json")
     save_json(metrics, output_dir / "metrics.json")
 
@@ -385,6 +424,11 @@ def main() -> None:
         gradient_accumulation_steps=resolved.gradient_accumulation_steps,
         mixed_precision=resolved.mixed_precision,
     )
+    configured_cpu_threads = configure_cpu_threading(accelerator, resolved.cpu_threads)
+    if configured_cpu_threads is not None:
+        accelerator.print(
+            f"CPU thread limit enabled for training/preprocessing: {configured_cpu_threads}"
+        )
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         resolved.base_model,
@@ -394,7 +438,37 @@ def main() -> None:
     )
     config = cast(Any, AutoConfig.from_pretrained(resolved.base_model, local_files_only=resolved.local_files_only))
 
-    speaker_embedding = extract_target_speaker_embedding(qwen3tts, train_data[0]["ref_audio"])
+    ref_audio_paths = collect_unique_ref_audios(train_data)
+    is_multi_speaker: bool
+    if resolved.multi_speaker_flag is not None:
+        is_multi_speaker = bool(resolved.multi_speaker_flag)
+    else:
+        is_multi_speaker = len(ref_audio_paths) > 1
+
+    if is_multi_speaker and len(ref_audio_paths) > 1:
+        accelerator.print(f"Multi-speaker mode: {len(ref_audio_paths)} unique reference audios detected")
+        speaker_name_map: dict[str, str] | None = None
+        if resolved.speaker_names_override:
+            names = cast(list[str], resolved.speaker_names_override)
+            if len(names) == len(ref_audio_paths):
+                speaker_name_map = dict(zip(ref_audio_paths, names))
+            else:
+                accelerator.print(
+                    f"WARNING: --speaker_names count ({len(names)}) != ref_audio count ({len(ref_audio_paths)}); "
+                    "using auto-inferred names"
+                )
+        speaker_data = extract_multi_speaker_embeddings(
+            qwen3tts,
+            ref_audio_paths,
+            base_speaker_id=resolved.speaker_base_id,
+            speaker_name_map=speaker_name_map,
+        )
+        speaker_embedding: torch.Tensor | dict[str, Any] = speaker_data
+        for ref_path, info in speaker_data.items():
+            accelerator.print(f"  Speaker '{info['speaker_name']}' (id={info['speaker_id']}) <- {Path(ref_path).name}")
+    else:
+        speaker_embedding = extract_target_speaker_embedding(qwen3tts, train_data[0]["ref_audio"])
+        accelerator.print(f"Single-speaker mode: '{resolved.speaker_name}' (id={resolved.speaker_id})")
 
     lora_config = build_lora_config(
         r=resolved.lora_r,
@@ -464,6 +538,7 @@ def main() -> None:
         "base_model": resolved.base_model,
         "speaker_name": resolved.speaker_name,
         "speaker_id": resolved.speaker_id,
+        "multi_speaker": is_multi_speaker,
         "trainable_params": trainable_params,
         "total_params": total_params,
         "trainable_ratio": trainable_params / total_params,
@@ -476,6 +551,7 @@ def main() -> None:
         "warmup_ratio": resolved.warmup_ratio,
         "num_training_steps": num_training_steps,
         "num_warmup_steps": num_warmup_steps,
+        "cpu_threads": configured_cpu_threads,
         "validation_enabled": bool(validation_data),
         "validation_source": validation_source,
         "validation_samples": len(validation_data),
@@ -622,10 +698,10 @@ def main() -> None:
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             unwrapped_model = accelerator.unwrap_model(model)
-            save_artifacts(output_root / f"checkpoint-epoch-{epoch}", unwrapped_model, lora_config, speaker_embedding, resolved, metrics)
-            save_artifacts(output_root, unwrapped_model, lora_config, speaker_embedding, resolved, metrics)
+            save_artifacts(output_root / f"checkpoint-epoch-{epoch}", unwrapped_model, lora_config, speaker_embedding, resolved, metrics, is_multi_speaker)
+            save_artifacts(output_root, unwrapped_model, lora_config, speaker_embedding, resolved, metrics, is_multi_speaker)
             if best_checkpoint_epoch == epoch and validation_result is not None:
-                save_artifacts(output_root / "best-checkpoint", unwrapped_model, lora_config, speaker_embedding, resolved, metrics)
+                save_artifacts(output_root / "best-checkpoint", unwrapped_model, lora_config, speaker_embedding, resolved, metrics, is_multi_speaker)
 
         if should_stop:
             break

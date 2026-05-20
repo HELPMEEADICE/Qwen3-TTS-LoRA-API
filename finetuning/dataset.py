@@ -36,9 +36,44 @@ class TTSDataset(Dataset):
         self.processor = processor
         self.lag_num = lag_num
         self.config = config
+        self._ref_mel_cache: dict[str, torch.Tensor] = {}
+        self._codec_const: torch.Tensor = torch.tensor(
+            [
+                config.talker_config.codec_nothink_id,
+                config.talker_config.codec_think_bos_id,
+                config.talker_config.codec_think_eos_id,
+                0,
+                config.talker_config.codec_pad_id,
+            ]
+        )
+        self._build_ref_mel_cache()
+        self._build_item_cache()
 
     def __len__(self):
-        return len(self.data_list)
+        return len(self._cached_items)
+
+    def _build_ref_mel_cache(self) -> None:
+        unique_refs: set[str] = set()
+        for item in self.data_list:
+            ref = item.get("ref_audio", "")
+            if ref and ref not in unique_refs:
+                unique_refs.add(ref)
+        for ref_path in sorted(unique_refs):
+            wav, sr = self._load_audio_to_np(ref_path)
+            self._ref_mel_cache[ref_path] = self.extract_mels(audio=wav, sr=sr)
+
+    def _build_item_cache(self) -> None:
+        self._cached_items: list[dict[str, torch.Tensor]] = []
+        for item in self.data_list:
+            text = self._build_assistant_text(item["text"])
+            text_ids = self._tokenize_texts(text)
+            audio_codes = torch.tensor(item["audio_codes"], dtype=torch.long)
+            ref_mel = self._ref_mel_cache[item["ref_audio"]]
+            self._cached_items.append({
+                "text_ids": text_ids[:, :-5],
+                "audio_codes": audio_codes,
+                "ref_mel": ref_mel,
+            })
     
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
         
@@ -118,30 +153,7 @@ class TTSDataset(Dataset):
 
 
     def __getitem__(self, idx):
-        item = self.data_list[idx]
-
-        audio_path  = item["audio"]
-        text        = item["text"]
-        audio_codes = item["audio_codes"]
-        language        = item.get('language','Auto')
-        ref_audio_path  = item['ref_audio']
-
-        text = self._build_assistant_text(text)
-        text_ids = self._tokenize_texts(text)
-
-        audio_codes = torch.tensor(audio_codes, dtype=torch.long)
-
-        ref_audio_list = self._ensure_list(ref_audio_path)
-        normalized = self._normalize_audio_inputs(ref_audio_list)
-        wav,sr = normalized[0]
-
-        ref_mel = self.extract_mels(audio=wav, sr=sr)
-
-        return {
-            "text_ids": text_ids[:,:-5],    # 1 , t
-            "audio_codes":audio_codes,      # t, 16
-            "ref_mel":ref_mel
-        }
+        return self._cached_items[idx]
         
     def collate_fn(self, batch):
         assert self.lag_num == -1
@@ -177,15 +189,7 @@ class TTSDataset(Dataset):
 
             # codec channel
             # input_ids[i,   :3, 1] = 0
-            input_ids[i,    3:8 ,1] = torch.tensor(
-                                        [
-                                            self.config.talker_config.codec_nothink_id,
-                                            self.config.talker_config.codec_think_bos_id,
-                                            self.config.talker_config.codec_think_eos_id,
-                                            0,     # for speaker embedding
-                                            self.config.talker_config.codec_pad_id       
-                                        ]
-                                    )
+            input_ids[i,    3:8 ,1] = self._codec_const
             input_ids[i,    8:8+text_ids_len-3  ,1] = self.config.talker_config.codec_pad_id
             input_ids[i,    8+text_ids_len-3    ,1] = self.config.talker_config.codec_pad_id
             input_ids[i,    8+text_ids_len-2    ,1] = self.config.talker_config.codec_bos_id
@@ -203,8 +207,15 @@ class TTSDataset(Dataset):
             codec_mask[i,   8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = True
             attention_mask[i, :8+text_ids_len+codec_ids_len] = True
         
-        ref_mels = [data['ref_mel'] for data in batch]
-        ref_mels = torch.cat(ref_mels,dim=0)
+        ref_mels = [data['ref_mel'].squeeze(0) for data in batch]
+        max_ref_mel_len = max(ref_mel.shape[0] for ref_mel in ref_mels)
+        padded_ref_mels = []
+        for ref_mel in ref_mels:
+            pad_frames = max_ref_mel_len - ref_mel.shape[0]
+            if pad_frames > 0:
+                ref_mel = torch.nn.functional.pad(ref_mel, (0, 0, 0, pad_frames))
+            padded_ref_mels.append(ref_mel)
+        ref_mels = torch.stack(padded_ref_mels, dim=0)
 
         return {
             'input_ids':input_ids,

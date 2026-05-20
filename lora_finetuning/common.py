@@ -280,6 +280,45 @@ def extract_target_speaker_embedding(qwen3tts: Any, ref_audio: str | Path) -> to
     return speaker_embedding
 
 
+def collect_unique_ref_audios(train_data: list[dict[str, Any]]) -> list[str]:
+    paths: set[str] = set()
+    for item in train_data:
+        ref = item.get("ref_audio", "")
+        if ref:
+            paths.add(ref)
+    return sorted(paths)
+
+
+def infer_speaker_name_from_ref_path(ref_path: str) -> str:
+    stem = Path(ref_path).stem
+    for prefix in ("ref_", "reference_", "speaker_"):
+        if stem.lower().startswith(prefix):
+            stem = stem[len(prefix):]
+    return stem
+
+
+@torch.inference_mode()
+def extract_multi_speaker_embeddings(
+    qwen3tts: Any,
+    ref_audio_paths: list[str],
+    base_speaker_id: int = 3000,
+    speaker_name_map: dict[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    speakers: dict[str, dict[str, Any]] = {}
+    for idx, ref_path in enumerate(ref_audio_paths):
+        embedding = extract_target_speaker_embedding(qwen3tts, ref_path)
+        if speaker_name_map and ref_path in speaker_name_map:
+            name = speaker_name_map[ref_path]
+        else:
+            name = infer_speaker_name_from_ref_path(ref_path)
+        speakers[ref_path] = {
+            "speaker_name": name,
+            "speaker_id": base_speaker_id + idx,
+            "embedding": embedding,
+        }
+    return speakers
+
+
 def make_config_patch(speaker_name: str, speaker_id: int) -> dict[str, Any]:
     return {
         "tts_model_type": "custom_voice",
@@ -294,6 +333,21 @@ def make_config_patch(speaker_name: str, speaker_id: int) -> dict[str, Any]:
     }
 
 
+def make_multi_speaker_config_patch(speakers: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    spk_id: dict[str, int] = {}
+    spk_is_dialect: dict[str, bool] = {}
+    for info in speakers.values():
+        spk_id[info["speaker_name"]] = int(info["speaker_id"])
+        spk_is_dialect[info["speaker_name"]] = False
+    return {
+        "tts_model_type": "custom_voice",
+        "talker_config": {
+            "spk_id": spk_id,
+            "spk_is_dialect": spk_is_dialect,
+        },
+    }
+
+
 def save_speaker_patch(path: str | Path, speaker_id: int, speaker_embedding: torch.Tensor) -> None:
     path = Path(path)
     ensure_dir(path.parent)
@@ -304,8 +358,34 @@ def save_speaker_patch(path: str | Path, speaker_id: int, speaker_embedding: tor
     save_file(tensor_dict, str(path))
 
 
+def save_multi_speaker_patch(path: str | Path, speakers: dict[str, dict[str, Any]]) -> None:
+    path = Path(path)
+    ensure_dir(path.parent)
+    tensor_dict: dict[str, torch.Tensor] = {}
+    for ref_path, info in speakers.items():
+        sid = int(info["speaker_id"])
+        tensor_dict[f"embedding_{sid}"] = info["embedding"].detach().cpu()
+    save_file(tensor_dict, str(path))
+
+
+def load_multi_speaker_patch(path: str | Path) -> dict[int, torch.Tensor]:
+    state = load_file(str(path))
+    patches: dict[int, torch.Tensor] = {}
+    for key, value in state.items():
+        if key.startswith("embedding_"):
+            sid = int(key.split("_", 1)[1])
+            patches[sid] = value
+    return patches
+
+
 def load_speaker_patch(path: str | Path) -> tuple[int, torch.Tensor]:
     state = load_file(str(path))
+    if any(k.startswith("embedding_") for k in state):
+        multi = load_multi_speaker_patch(path)
+        if not multi:
+            raise KeyError(f"Empty multi-speaker patch: {path}")
+        first_id = next(iter(multi))
+        return first_id, multi[first_id]
     if "speaker_id" not in state or "embedding" not in state:
         raise KeyError(f"Speaker patch {path} must contain 'speaker_id' and 'embedding'")
     speaker_id = int(state["speaker_id"].view(-1)[0].item())
@@ -379,13 +459,68 @@ def apply_speaker_patch(model: Any, speaker_patch_file: str | Path) -> int:
     return speaker_id
 
 
+def apply_multi_speaker_patches(
+    model: Any,
+    speaker_patch_file: str | Path,
+    config_patch: dict[str, Any],
+    speaker_names: list[str] | None = None,
+) -> list[int]:
+    patches = load_multi_speaker_patch(speaker_patch_file)
+    spk_id = config_patch["talker_config"]["spk_id"]
+    target_weight = model.talker.model.codec_embedding.weight
+
+    if speaker_names:
+        target_speakers = [s for s in speaker_names if s in spk_id]
+    else:
+        target_speakers = list(spk_id.keys())
+
+    applied: list[int] = []
+    for name in target_speakers:
+        sid = int(spk_id[name])
+        if sid not in patches:
+            continue
+        embedding = patches[sid]
+        if sid >= target_weight.shape[0]:
+            raise IndexError(
+                f"speaker_id {sid} for '{name}' is out of range (max {target_weight.shape[0]})"
+            )
+        embedding = embedding.to(device=target_weight.device, dtype=target_weight.dtype).view(-1)
+        if embedding.shape[0] != target_weight.shape[1]:
+            raise ValueError(
+                f"Speaker embedding dim mismatch for '{name}': "
+                f"expected {target_weight.shape[1]}, got {embedding.shape[0]}"
+            )
+        with torch.no_grad():
+            target_weight[sid].copy_(embedding)
+        applied.append(sid)
+
+    return applied
+
+
+def apply_single_speaker_from_multi(
+    model: Any,
+    speaker_patch_file: str | Path,
+    config_patch: dict[str, Any],
+    speaker_name: str,
+) -> int:
+    applied = apply_multi_speaker_patches(model, speaker_patch_file, config_patch, speaker_names=[speaker_name])
+    if not applied:
+        available = list(config_patch.get("talker_config", {}).get("spk_id", {}).keys())
+        raise ValueError(
+            f"Speaker '{speaker_name}' not found in multi-speaker patch. Available: {available}"
+        )
+    return applied[0]
+
+
 def build_bundle_manifest(
     base_model_path: str,
     speaker_name: str,
     speaker_id: int,
     adapter_subdir: str = "adapter",
+    multi_speaker: bool = False,
+    speaker_names: list[str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    manifest: dict[str, Any] = {
         "format_version": 1,
         "base_model_path": base_model_path,
         "adapter_dir": adapter_subdir,
@@ -393,4 +528,8 @@ def build_bundle_manifest(
         "config_patch_file": "config_patch.json",
         "speaker_name": speaker_name,
         "speaker_id": speaker_id,
+        "multi_speaker": multi_speaker,
     }
+    if multi_speaker and speaker_names:
+        manifest["speaker_names"] = speaker_names
+    return manifest

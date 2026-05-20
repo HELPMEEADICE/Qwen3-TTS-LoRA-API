@@ -328,6 +328,74 @@ artifacts:
         self.assertEqual(config_patch["tts_model_type"], "custom_voice")
         self.assertEqual(config_patch["talker_config"]["spk_id"]["smoke_speaker"], 3000)
 
+    def test_save_artifacts_multi_speaker_writes_combined_patch(self) -> None:
+        output_dir = self.make_temp_dir() / "artifacts_multi"
+        model, lora_config = self.build_dummy_lora_model()
+        resolved = sft_12hz_lora.ResolvedConfig(
+            base_model="models/Qwen3-TTS-12Hz-1.7B-Base",
+            train_jsonl="resources/segments/train_with_codes_qwen3tts.jsonl",
+            output_root=str(output_dir),
+            speaker_name="speaker_a",
+            speaker_id=3000,
+            speaker_base_id=3000,
+            speaker_names_override=None,
+            multi_speaker_flag=True,
+        )
+        metrics = {"epoch_losses": []}
+        multi_embedding = {
+            "ref_a.wav": {"speaker_name": "alice", "speaker_id": 3000, "embedding": torch.randn(8)},
+            "ref_b.wav": {"speaker_name": "bob", "speaker_id": 3001, "embedding": torch.randn(8)},
+        }
+
+        sft_12hz_lora.save_artifacts(
+            output_dir, model, lora_config, multi_embedding, resolved, metrics, is_multi_speaker=True,
+        )
+
+        self.assertTrue((output_dir / "speaker_embedding.safetensors").exists())
+        config_patch = common.load_json(output_dir / "config_patch.json")
+        self.assertEqual(config_patch["talker_config"]["spk_id"]["alice"], 3000)
+        self.assertEqual(config_patch["talker_config"]["spk_id"]["bob"], 3001)
+
+        patches = common.load_multi_speaker_patch(output_dir / "speaker_embedding.safetensors")
+        self.assertIn(3000, patches)
+        self.assertIn(3001, patches)
+        self.assertEqual(tuple(patches[3000].shape), (8,))
+        self.assertEqual(tuple(patches[3001].shape), (8,))
+
+        speaker_id, embedding = common.load_speaker_patch(output_dir / "speaker_embedding.safetensors")
+        self.assertIn(speaker_id, [3000, 3001])
+        self.assertEqual(tuple(embedding.shape), (8,))
+
+    def test_multi_speaker_config_patch_aggregates_all_speakers(self) -> None:
+        speakers = {
+            "ref_a.wav": {"speaker_name": "alice", "speaker_id": 3000, "embedding": torch.randn(8)},
+            "ref_b.wav": {"speaker_name": "bob", "speaker_id": 3001, "embedding": torch.randn(8)},
+            "ref_c.wav": {"speaker_name": "carol", "speaker_id": 3002, "embedding": torch.randn(8)},
+        }
+        config_patch = common.make_multi_speaker_config_patch(speakers)
+        self.assertEqual(config_patch["tts_model_type"], "custom_voice")
+        spk_id = config_patch["talker_config"]["spk_id"]
+        self.assertEqual(spk_id["alice"], 3000)
+        self.assertEqual(spk_id["bob"], 3001)
+        self.assertEqual(spk_id["carol"], 3002)
+        self.assertFalse(config_patch["talker_config"]["spk_is_dialect"]["alice"])
+
+    def test_collect_unique_ref_audios_deduplicates_paths(self) -> None:
+        train_data = [
+            {"ref_audio": "voice/ref_alice.wav", "audio": "a.wav", "text": "hello"},
+            {"ref_audio": "voice/ref_bob.wav", "audio": "b.wav", "text": "world"},
+            {"ref_audio": "voice/ref_alice.wav", "audio": "c.wav", "text": "test"},
+        ]
+        refs = common.collect_unique_ref_audios(train_data)
+        self.assertEqual(len(refs), 2)
+        self.assertIn("voice/ref_alice.wav", refs)
+        self.assertIn("voice/ref_bob.wav", refs)
+
+    def test_infer_speaker_name_from_ref_path(self) -> None:
+        self.assertEqual(common.infer_speaker_name_from_ref_path("voice/ref_alice.wav"), "alice")
+        self.assertEqual(common.infer_speaker_name_from_ref_path("voice/speaker_bob.wav"), "bob")
+        self.assertEqual(common.infer_speaker_name_from_ref_path("voice/carol.wav"), "carol")
+
     def test_export_custom_voice_bundles_artifacts_and_manifest(self) -> None:
         source_dir = self.make_temp_dir() / "train_outputs"
         output_dir = self.make_temp_dir() / "bundle"

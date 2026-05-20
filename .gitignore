@@ -30,3 +30,7 @@ env/
 /benchmark/**/faster_cache/**
 vllm_omni_service/.venv/*
 vllm_omni_service/logs/*
+*.bat
+lora/
+voice/
+build_venv/
