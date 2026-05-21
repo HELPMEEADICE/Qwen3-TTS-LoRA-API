@@ -61,6 +61,10 @@ class QwenTTSGUI:
         self._chunk_pos = 0                # position in current chunk
         self._stream_lock = threading.Lock() # 用于保护流资源的锁
 
+        self.lora_info = None
+        self.lora_var = tk.StringVar()
+        self.speaker_var = tk.StringVar()
+
         self._build_ui()
         self._update_play_btn()
 
@@ -152,7 +156,30 @@ class QwenTTSGUI:
         topp_spin = ttk.Spinbox(ctrl_row, from_=0.1, to=1.0, increment=0.05, textvariable=self.topp_var, width=5)
         topp_spin.pack(side=tk.LEFT)
 
-        # Row 3: Buttons
+        # Row 3: LoRA settings
+        lora_frame = ttk.LabelFrame(main, text="LoRA 设置", padding="5")
+        lora_frame.pack(fill=tk.X, pady=(0, 8))
+
+        lora_row1 = ttk.Frame(lora_frame)
+        lora_row1.pack(fill=tk.X)
+
+        ttk.Label(lora_row1, text="选择 LoRA:").pack(side=tk.LEFT, padx=(0, 4))
+        self.lora_cb = ttk.Combobox(lora_row1, textvariable=self.lora_var, state="readonly", width=22)
+        self.lora_cb.pack(side=tk.LEFT, padx=(0, 8))
+        self.lora_cb['values'] = ["不使用 LoRA"]
+        self.lora_cb.bind("<<ComboboxSelected>>", self._on_lora_selected)
+
+        ttk.Label(lora_row1, text="说话人:").pack(side=tk.LEFT, padx=(0, 4))
+        self.speaker_cb = ttk.Combobox(lora_row1, textvariable=self.speaker_var, state="disabled", width=16)
+        self.speaker_cb.pack(side=tk.LEFT, padx=(0, 8))
+        self.speaker_cb['values'] = ["语音克隆模式"]
+
+        self.refresh_lora_btn = ttk.Button(lora_row1, text="刷新列表", command=self._refresh_lora_list, width=10)
+        self.refresh_lora_btn.pack(side=tk.RIGHT)
+
+        ttk.Label(lora_frame, text="提示: 需服务端启用 --lora-all; 不选则使用参考音色克隆").pack(anchor=tk.W, pady=(2, 0))
+
+        # Row 4: Buttons
         btn_frame = ttk.Frame(main)
         btn_frame.pack(fill=tk.X, pady=(0, 8))
 
@@ -235,6 +262,67 @@ class QwenTTSGUI:
         finally:
             self.root.after(0, lambda: self.test_btn.configure(state=tk.NORMAL))
 
+    # ---------- LoRA ----------
+
+    def _on_lora_selected(self, event=None):
+        lora_id = self.lora_var.get()
+        if not lora_id or lora_id == "不使用 LoRA":
+            self.speaker_cb['values'] = ["语音克隆模式"]
+            self.speaker_cb.set("语音克隆模式")
+            self.speaker_cb.configure(state=tk.DISABLED)
+            return
+
+        if self.lora_info and lora_id in self.lora_info.get("loras", {}):
+            speakers = self.lora_info["loras"][lora_id].get("speakers", [])
+            self.speaker_cb['values'] = ["语音克隆模式"] + speakers
+            self.speaker_cb.set("语音克隆模式")
+            self.speaker_cb.configure(state=tk.NORMAL)
+
+    def _refresh_lora_list(self):
+        self._log("正在刷新 LoRA 列表...")
+        self.refresh_lora_btn.configure(state=tk.DISABLED)
+        threading.Thread(target=self._do_refresh_lora_list, daemon=True).start()
+
+    def _do_refresh_lora_list(self):
+        try:
+            r = requests.get(f"{self.api_url.get().rstrip('/')}/lora/list", timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                self.lora_info = data
+                self.root.after(0, self._update_lora_ui)
+            else:
+                self.root.after(0, lambda: self._log("多 LoRA 功能未启用 (服务端需 --lora-all)", "warn"))
+        except Exception as e:
+            self.root.after(0, lambda: self._log(f"刷新 LoRA 列表失败: {e}", "error"))
+        finally:
+            self.root.after(0, lambda: self.refresh_lora_btn.configure(state=tk.NORMAL))
+
+    def _update_lora_ui(self):
+        if not self.lora_info:
+            return
+        loras = list(self.lora_info.get("loras", {}).keys())
+        self.lora_cb['values'] = ["不使用 LoRA"] + loras
+
+        active = self.lora_info.get("active_lora_id")
+        active_speaker = self.lora_info.get("active_speaker")
+
+        if active and active in self.lora_info["loras"]:
+            self.lora_var.set(active)
+            speakers = self.lora_info["loras"][active].get("speakers", [])
+            self.speaker_cb['values'] = ["语音克隆模式"] + speakers
+            if active_speaker and active_speaker in speakers:
+                self.speaker_var.set(active_speaker)
+            else:
+                self.speaker_var.set("语音克隆模式")
+            self.speaker_cb.configure(state=tk.NORMAL)
+            self._log(f"当前活跃 LoRA: {active}" + (f" ({active_speaker})" if active_speaker else ""), "info")
+        else:
+            self.lora_var.set("不使用 LoRA")
+            self.speaker_cb['values'] = ["语音克隆模式"]
+            self.speaker_cb.set("语音克隆模式")
+            self.speaker_cb.configure(state=tk.DISABLED)
+            self._log("当前无活跃 LoRA (voice_clone 模式)", "info")
+
     def _browse_ref_audio(self):
         path = filedialog.askopenfilename(
             title="选择参考音频",
@@ -248,11 +336,16 @@ class QwenTTSGUI:
         ref_text = self.ref_text.get("1.0", tk.END).strip()
         syn_text = self.syn_text.get("1.0", tk.END).strip()
 
-        if not ref_path:
-            messagebox.showwarning("缺少参数", "请选择参考音频文件")
-            return
+        lora_id = self.lora_var.get().strip() if self.lora_info else ""
+        has_speaker = (lora_id and lora_id != "不使用 LoRA"
+                       and self.speaker_var.get().strip()
+                       and self.speaker_var.get().strip() != "语音克隆模式")
+
         if not syn_text:
             messagebox.showwarning("缺少参数", "请输入合成文本")
+            return
+        if not ref_path and not has_speaker:
+            messagebox.showwarning("缺少参数", "请选择参考音频文件")
             return
 
         # Reset state
@@ -270,6 +363,9 @@ class QwenTTSGUI:
         self._log("正在生成语音...")
 
         use_stream = self.stream_var.get()
+        lora_id = self.lora_var.get().strip() if self.lora_info else ""
+        speaker = self.speaker_var.get().strip() if self.lora_info else ""
+
         payload = {
             "refer_wav_path": ref_path,
             "text": syn_text,
@@ -280,6 +376,13 @@ class QwenTTSGUI:
         }
         if ref_text:
             payload["prompt_text"] = ref_text
+
+        if lora_id and lora_id != "不使用 LoRA":
+            payload["lora_id"] = lora_id
+            if speaker and speaker != "语音克隆模式":
+                payload["speaker"] = speaker
+        else:
+            payload["lora_id"] = ""
 
         if use_stream:
             payload["stream_mode"] = "normal"

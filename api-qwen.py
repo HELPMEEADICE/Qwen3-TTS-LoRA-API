@@ -656,12 +656,13 @@ def load_model(model_path: str, dtype: torch.dtype, attn_implementation: str,
     print("CUDA Graphs 初始化完成")
 
 
-def _request_lora_switch(lora_id: str, speaker: str | None) -> str | None:
+def _request_lora_switch(lora_id: str | None, speaker: str | None) -> str | None:
     """
     请求级别的LoRA切换。返回当前活跃的说话人名（None表示voice_clone模式）。
     
-    如果请求指定的lora_id与当前活跃的一致（且speaker一致），跳过切换。
-    如果lora_id为None或空字符串，卸载LoRA。
+    - lora_id=None: 不切换，使用当前状态
+    - lora_id="" : 卸载LoRA，回到voice_clone模式
+    - lora_id="xxx": 切换到对应LoRA（speaker可选）
     """
     global lora_manager
 
@@ -670,12 +671,14 @@ def _request_lora_switch(lora_id: str, speaker: str | None) -> str | None:
             raise ValueError("多LoRA功能未启用 (启动时需加 --lora-all)")
         return None
 
-    if not lora_id or lora_id.strip() == "":
+    if lora_id is None:
+        return lora_manager.active_speaker
+
+    lora_id = lora_id.strip()
+    if lora_id == "":
         if lora_manager.is_active:
             lora_manager._deactivate_internal()
         return None
-
-    lora_id = lora_id.strip()
 
     if lora_manager.active_lora_id == lora_id and lora_manager.active_speaker == speaker:
         return speaker
