@@ -34,3 +34,4 @@ vllm_omni_service/logs/*
 lora/
 voice/
 build_venv/
+convert_to_wav.ps1
